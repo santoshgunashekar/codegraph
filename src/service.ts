@@ -519,23 +519,28 @@ export class CodeGraphService {
 
           // Detect export/API surface exposure
           if (lineText.startsWith("export")) {
-            exportSurfaces.push({
-              file: relPath,
-              line: line + 1,
-              surface: lineText.includes("from") ? "re-export" : "public API export",
-            });
+            let surface = "public API export";
+            if (lineText.includes("from")) surface = "re-export";
+            else if (lineText.startsWith("export function")) surface = "exported function signature";
+            else if (lineText.startsWith("export class")) surface = "exported class";
+            else if (lineText.startsWith("export interface")) surface = "exported interface";
+            else if (lineText.startsWith("export type")) surface = "exported type";
+            else if (lineText.startsWith("export const") || lineText.startsWith("export let")) surface = "exported variable";
+            exportSurfaces.push({ file: relPath, line: line + 1, surface });
           }
         }
       }
     }
 
-    // Check if the symbol itself is exported
+    // Check if the symbol itself is exported (use TypeChecker for reliability)
     const sourceFile = this.program.getSourceFile(loc.fileName);
     let isExported = false;
     if (sourceFile) {
-      const node = this.findNodeAtPosition(sourceFile, loc.position);
-      if (node && node.parent) {
-        isExported = this.hasExportModifier(node.parent);
+      const checker = this.program.getTypeChecker();
+      const sourceSymbol = checker.getSymbolAtLocation(sourceFile);
+      if (sourceSymbol) {
+        const exports = checker.getExportsOfModule(sourceSymbol);
+        isExported = exports.some(e => e.getName() === loc.name);
       }
     }
 
