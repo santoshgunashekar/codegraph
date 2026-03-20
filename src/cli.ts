@@ -4,6 +4,8 @@ import path from "path";
 import fs from "fs";
 import { CodeGraphService } from "./service.js";
 import { undoLast } from "./rollback.js";
+import { getSchema } from "./schema.js";
+import { startWatchServer, sendToWatch } from "./watch.js";
 
 function findTsConfig(startDir: string): string | null {
   let dir = startDir;
@@ -14,52 +16,6 @@ function findTsConfig(startDir: string): string | null {
     if (parent === dir) return null;
     dir = parent;
   }
-}
-
-function printUsage(): void {
-  const usage = {
-    success: false,
-    operation: "help",
-    duration_ms: 0,
-    result: {
-      commands: {
-        "refs": {
-          description: "Find all references to a symbol",
-          usage: "codegraph refs --of <symbol>",
-          example: "codegraph refs --of User",
-        },
-        "callers": {
-          description: "Find all callers of a function",
-          usage: "codegraph callers --of <symbol>",
-          example: "codegraph callers --of processOrder",
-        },
-        "check-unused": {
-          description: "Check if a symbol is unused",
-          usage: "codegraph check-unused --symbol <name>",
-          example: "codegraph check-unused --symbol formatLegacyDate",
-        },
-        "rename": {
-          description: "Rename a symbol across the entire project",
-          usage: "codegraph rename --symbol <old> --to <new> [--dry-run]",
-          example: "codegraph rename --symbol User --to Account",
-        },
-      },
-      symbol_formats: [
-        "Name: --symbol User",
-        "Qualified: --symbol UserService.create",
-        "File:line: --symbol src/types.ts:14",
-      ],
-      flags: {
-        "--project": "Path to tsconfig.json (auto-detected if omitted)",
-        "--dry-run": "Preview changes without applying (rename only)",
-        "--format": "Output format: json (default) or human",
-      },
-    },
-    files_modified: [],
-    warnings: [],
-    errors: [{ code: "NO_COMMAND", message: "No command specified" }],
-  };
-  console.log(JSON.stringify(usage, null, 2));
 }
 
 function parseArgs(args: string[]): {
@@ -131,7 +87,6 @@ function parseArgs(args: string[]): {
         result.position = parseInt(args[++i] ?? "", 10);
         break;
       default:
-        // Ignore unknown flags
         break;
     }
     i++;
@@ -178,39 +133,57 @@ function formatHuman(result: Record<string, unknown>): string {
   return lines.join("\n");
 }
 
-function main(): void {
+function outputResult(result: { success: boolean; result: Record<string, unknown>; errors: Array<{ code: string; message: string }> }, format: string): void {
+  if (format === "human") {
+    if (result.success) {
+      console.log(formatHuman(result.result));
+    } else {
+      console.error(formatHuman({ errors: result.errors }));
+    }
+  } else {
+    console.log(JSON.stringify(result, null, 2));
+  }
+}
+
+async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
+  // --- Commands that don't need tsconfig ---
+
   if (!args.command) {
-    printUsage();
-    process.exit(1);
+    console.log(getSchema("commands"));
+    process.exit(0);
   }
 
-  // Find tsconfig
+  if (args.command === "schema") {
+    console.log(getSchema(args.format || "openai"));
+    process.exit(0);
+  }
+
+  // --- Find tsconfig ---
+
   const tsconfigPath = args.project
     ? path.resolve(args.project)
     : findTsConfig(process.cwd());
 
   if (!tsconfigPath || !fs.existsSync(tsconfigPath)) {
-    const error = {
+    console.log(JSON.stringify({
       success: false,
       operation: args.command,
       duration_ms: 0,
       result: {},
       files_modified: [],
       warnings: [],
-      errors: [{
-        code: "NO_TSCONFIG",
-        message: "No tsconfig.json found. Use --project to specify.",
-      }],
-    };
-    console.log(JSON.stringify(error, null, 2));
+      errors: [{ code: "NO_TSCONFIG", message: "No tsconfig.json found. Use --project to specify." }],
+    }, null, 2));
     process.exit(1);
   }
 
-  // Handle undo before initializing service (doesn't need compiler)
+  const projectRoot = path.dirname(tsconfigPath);
+
+  // --- Commands that don't need the compiler ---
+
   if (args.command === "undo") {
-    const projectRoot = path.dirname(tsconfigPath);
     const undoResult = undoLast(projectRoot);
     const output = {
       success: undoResult.success,
@@ -228,57 +201,48 @@ function main(): void {
     process.exit(undoResult.success ? 0 : 1);
   }
 
-  // Initialize service
-  const service = new CodeGraphService(tsconfigPath);
+  if (args.command === "watch") {
+    startWatchServer(tsconfigPath);
+    return; // watch runs forever
+  }
 
+  // --- Try watch server first (skip cold start) ---
+
+  const watchArgs = buildWatchArgs(args);
+  if (watchArgs) {
+    const watchResult = await sendToWatch(projectRoot, args.command, watchArgs);
+    if (watchResult) {
+      // Got result from watch server
+      const parsed = JSON.parse(watchResult);
+      outputResult(parsed, args.format);
+      process.exit(parsed.success ? 0 : 1);
+    }
+    // No watch server running — fall through to direct execution
+  }
+
+  // --- Direct execution (cold start) ---
+
+  const service = new CodeGraphService(tsconfigPath);
   let result;
 
   switch (args.command) {
     case "refs":
-      if (!args.symbol) {
-        console.log(JSON.stringify({
-          success: false,
-          operation: "refs",
-          errors: [{ code: "MISSING_ARG", message: "Missing --of <symbol>" }],
-        }, null, 2));
-        process.exit(1);
-      }
+      if (!args.symbol) { exitMissingArg("refs", "--of <symbol>"); return; }
       result = service.findReferences(args.symbol);
       break;
 
     case "callers":
-      if (!args.symbol) {
-        console.log(JSON.stringify({
-          success: false,
-          operation: "callers",
-          errors: [{ code: "MISSING_ARG", message: "Missing --of <symbol>" }],
-        }, null, 2));
-        process.exit(1);
-      }
+      if (!args.symbol) { exitMissingArg("callers", "--of <symbol>"); return; }
       result = service.findCallers(args.symbol);
       break;
 
     case "check-unused":
-      if (!args.symbol) {
-        console.log(JSON.stringify({
-          success: false,
-          operation: "check-unused",
-          errors: [{ code: "MISSING_ARG", message: "Missing --symbol <name>" }],
-        }, null, 2));
-        process.exit(1);
-      }
+      if (!args.symbol) { exitMissingArg("check-unused", "--symbol <name>"); return; }
       result = service.checkUnused(args.symbol);
       break;
 
     case "rename":
-      if (!args.symbol || !args.to) {
-        console.log(JSON.stringify({
-          success: false,
-          operation: "rename",
-          errors: [{ code: "MISSING_ARG", message: "Missing --symbol <old> --to <new>" }],
-        }, null, 2));
-        process.exit(1);
-      }
+      if (!args.symbol || !args.to) { exitMissingArg("rename", "--symbol <old> --to <new>"); return; }
       result = service.rename(args.symbol, args.to, args.dryRun);
       break;
 
@@ -287,45 +251,23 @@ function main(): void {
       break;
 
     case "impact":
-      if (!args.symbol) {
-        console.log(JSON.stringify({
-          success: false,
-          operation: "impact",
-          errors: [{ code: "MISSING_ARG", message: "Missing --of <symbol>" }],
-        }, null, 2));
-        process.exit(1);
-      }
+      if (!args.symbol) { exitMissingArg("impact", "--of <symbol>"); return; }
       result = service.impact(args.symbol);
       break;
 
     case "move":
-      if (!args.symbol || !args.to) {
-        console.log(JSON.stringify({
-          success: false,
-          operation: "move",
-          errors: [{ code: "MISSING_ARG", message: "Missing --symbol <name> --to <file>" }],
-        }, null, 2));
-        process.exit(1);
-      }
+      if (!args.symbol || !args.to) { exitMissingArg("move", "--symbol <name> --to <file>"); return; }
       result = service.moveSymbol(args.symbol, args.to, args.dryRun);
       break;
 
     case "add-param":
-      if (!args.symbol || !args.name || !args.type) {
-        console.log(JSON.stringify({
-          success: false,
-          operation: "add-param",
-          errors: [{ code: "MISSING_ARG", message: "Missing --function <name> --name <param> --type <type>" }],
-        }, null, 2));
-        process.exit(1);
-      }
-      result = service.addParam(
-        args.symbol,
-        args.name,
-        args.type,
-        args.default_value || undefined,
-        args.position,
-      );
+      if (!args.symbol || !args.name || !args.type) { exitMissingArg("add-param", "--function <name> --name <param> --type <type>"); return; }
+      result = service.addParam(args.symbol, args.name, args.type, args.default_value || undefined, args.position);
+      break;
+
+    case "delete":
+      if (!args.symbol) { exitMissingArg("delete", "--symbol <name>"); return; }
+      result = service.deleteSymbol(args.symbol, args.dryRun);
       break;
 
     default:
@@ -337,17 +279,42 @@ function main(): void {
       process.exit(1);
   }
 
-  if (args.format === "human") {
-    if (result.success) {
-      console.log(formatHuman(result.result));
-    } else {
-      console.error(formatHuman({ errors: result.errors }));
-    }
-  } else {
-    console.log(JSON.stringify(result, null, 2));
-  }
-
+  outputResult(result, args.format);
   process.exit(result.success ? 0 : 1);
+}
+
+function buildWatchArgs(args: ReturnType<typeof parseArgs>): Record<string, unknown> | null {
+  switch (args.command) {
+    case "refs":
+    case "callers":
+    case "check-unused":
+    case "impact":
+      return args.symbol ? { symbol: args.symbol } : null;
+    case "rename":
+      return args.symbol && args.to ? { symbol: args.symbol, to: args.to, dryRun: args.dryRun } : null;
+    case "move":
+      return args.symbol && args.to ? { symbol: args.symbol, to: args.to, dryRun: args.dryRun } : null;
+    case "dead-code":
+      return { scope: args.scope || undefined };
+    case "add-param":
+      return args.symbol && args.name && args.type ? {
+        symbol: args.symbol, name: args.name, type: args.type,
+        default: args.default_value || undefined, position: args.position,
+      } : null;
+    case "delete":
+      return args.symbol ? { symbol: args.symbol, dryRun: args.dryRun } : null;
+    default:
+      return null;
+  }
+}
+
+function exitMissingArg(operation: string, missing: string): void {
+  console.log(JSON.stringify({
+    success: false,
+    operation,
+    errors: [{ code: "MISSING_ARG", message: `Missing ${missing}` }],
+  }, null, 2));
+  process.exit(1);
 }
 
 main();

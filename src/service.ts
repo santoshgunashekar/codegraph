@@ -946,6 +946,152 @@ export class CodeGraphService {
     };
   }
 
+  /**
+   * Delete a symbol and clean up its imports/exports.
+   */
+  deleteSymbol(symbolRef: string, dryRun: boolean = false): CodeGraphResult {
+    const start = Date.now();
+    const locations = this.resolveSymbol(symbolRef);
+
+    if (locations.length === 0) {
+      return this.errorResult("delete", "SYMBOL_NOT_FOUND", `No symbol '${symbolRef}' found`, start);
+    }
+    if (locations.length > 1) {
+      return this.ambiguousResult("delete", symbolRef, locations, start);
+    }
+
+    const loc = locations[0];
+
+    // Check if it's actually unused
+    const unusedResult = this.checkUnused(symbolRef);
+    if (unusedResult.success && !(unusedResult.result as { is_unused: boolean }).is_unused) {
+      const usageCount = (unusedResult.result as { usage_count: number }).usage_count;
+      return {
+        success: false,
+        operation: "delete",
+        duration_ms: Date.now() - start,
+        result: { usage_count: usageCount },
+        files_modified: [],
+        warnings: [],
+        errors: [{
+          code: "SYMBOL_IN_USE",
+          message: `'${symbolRef}' has ${usageCount} usage(s). Use --force or remove usages first. Run 'codegraph callers --of ${symbolRef}' to see them.`,
+        }],
+      };
+    }
+
+    const sourceFile = this.program.getSourceFile(loc.fileName);
+    if (!sourceFile) {
+      return this.errorResult("delete", "FILE_NOT_FOUND", `Source file not found`, start);
+    }
+
+    // Find the declaration node
+    const declNode = this.findDeclarationAtPosition(sourceFile, loc.position);
+    if (!declNode) {
+      return this.errorResult("delete", "NO_DECLARATION", `Could not find declaration for '${symbolRef}'`, start);
+    }
+
+    // Find files that import/re-export this symbol (to clean up)
+    const refs = this.service.findReferences(loc.fileName, loc.position);
+    const importFiles = new Map<string, { line: number; text: string }>();
+    if (refs) {
+      for (const refGroup of refs) {
+        for (const ref of refGroup.references) {
+          if (ref.fileName === loc.fileName) continue;
+          const refSf = this.program.getSourceFile(ref.fileName);
+          if (!refSf || refSf.isDeclarationFile) continue;
+          const relPath = path.relative(this.projectRoot, ref.fileName);
+          if (relPath.startsWith("..")) continue;
+          const { line } = refSf.getLineAndCharacterOfPosition(ref.textSpan.start);
+          const lineText = refSf.getFullText().substring(
+            refSf.getPositionOfLineAndCharacter(line, 0),
+            refSf.getLineEndOfPosition(ref.textSpan.start)
+          ).trim();
+          if (lineText.startsWith("import") || (lineText.startsWith("export") && lineText.includes("from"))) {
+            importFiles.set(ref.fileName, { line: line + 1, text: lineText });
+          }
+        }
+      }
+    }
+
+    const filesModified: string[] = [];
+    const cleanedImports: Array<{ file: string; action: string }> = [];
+
+    if (!dryRun) {
+      // Save rollback
+      saveRollback(this.projectRoot, "delete", [loc.fileName, ...importFiles.keys()]);
+
+      // 1. Remove the declaration from source file
+      let content = sourceFile.getFullText();
+      const declStart = declNode.getFullStart();
+      const declEnd = declNode.getEnd();
+      // Also remove trailing newline if present
+      let end = declEnd;
+      if (content[end] === "\n") end++;
+      content = content.substring(0, declStart) + content.substring(end);
+      fs.writeFileSync(loc.fileName, content, "utf-8");
+      filesModified.push(path.relative(this.projectRoot, loc.fileName));
+
+      // 2. Clean up imports/re-exports in other files
+      for (const [importFile, importInfo] of importFiles) {
+        let fileContent = fs.readFileSync(importFile, "utf-8");
+        const lines = fileContent.split("\n");
+        const lineIdx = importInfo.line - 1;
+        const importLine = lines[lineIdx];
+
+        if (importLine) {
+          // Remove the symbol from the import
+          let updated = importLine.replace(new RegExp(`\\b${loc.name}\\b,?\\s*`), "");
+          updated = updated.replace(/\{\s*,/, "{").replace(/,\s*\}/, " }").replace(/,\s*,/, ",");
+
+          // If import is now empty, remove the line
+          if (updated.match(/\{\s*\}/) || updated.match(/import\s*\{\s*\}\s*from/)) {
+            lines.splice(lineIdx, 1);
+          } else {
+            lines[lineIdx] = updated;
+          }
+
+          fileContent = lines.join("\n");
+          fs.writeFileSync(importFile, fileContent, "utf-8");
+          const relPath = path.relative(this.projectRoot, importFile);
+          filesModified.push(relPath);
+          cleanedImports.push({ file: relPath, action: `Removed '${loc.name}' from import` });
+        }
+      }
+    } else {
+      filesModified.push(path.relative(this.projectRoot, loc.fileName));
+      for (const [importFile] of importFiles) {
+        const relPath = path.relative(this.projectRoot, importFile);
+        filesModified.push(relPath);
+        cleanedImports.push({ file: relPath, action: `Would remove '${loc.name}' from import` });
+      }
+    }
+
+    return {
+      success: true,
+      operation: "delete",
+      duration_ms: Date.now() - start,
+      result: {
+        deleted: loc.name,
+        kind: loc.kind,
+        from: path.relative(this.projectRoot, loc.fileName),
+        dry_run: dryRun,
+        imports_cleaned: cleanedImports,
+        files_affected: filesModified.length,
+      },
+      files_modified: filesModified,
+      warnings: [],
+      errors: [],
+    };
+  }
+
+  /**
+   * Refresh the program after external file changes.
+   */
+  refresh(): void {
+    this.program = this.service.getProgram()!;
+  }
+
   // --- Internal helpers ---
 
   private hasExportModifier(node: ts.Node): boolean {

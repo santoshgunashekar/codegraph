@@ -46,6 +46,9 @@ codegraph move --symbol <name> --to <file> [--dry-run]
 # Add a parameter to a function, update all call sites
 codegraph add-param --function <name> --name <param> --type <type> [--default <value>]
 
+# Delete an unused symbol and clean up imports
+codegraph delete --symbol <name> [--dry-run]
+
 # Undo the last mutate operation
 codegraph undo
 ```
