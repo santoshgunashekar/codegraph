@@ -1,10 +1,11 @@
 {
   "name": "codegraph-refactor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "IDE refactoring, but for AI agents. Compiler-powered code operations as a CLI.",
   "type": "module",
   "bin": {
-    "codegraph": "./dist/cli.js"
+    "codegraph": "./dist/cli.js",
+    "codegraph-mcp": "./dist/mcp.js"
   },
   "files": [
     "dist",
@@ -27,7 +28,9 @@
     "codemod",
     "cli",
     "llm",
-    "developer-tools"
+    "developer-tools",
+    "mcp",
+    "model-context-protocol"
   ],
   "license": "MIT",
   "repository": {
@@ -38,7 +41,9 @@
     "node": ">=18"
   },
   "dependencies": {
-    "typescript": "^5.7.0"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "typescript": "^5.7.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"
