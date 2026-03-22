@@ -1,6 +1,6 @@
 {
   "name": "codegraph-refactor",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "IDE refactoring, but for AI agents. Compiler-powered code operations as a CLI.",
   "type": "module",
   "bin": {

@@ -1600,6 +1600,307 @@ export class CodeGraphService {
   }
 
   /**
+   * Get everything an agent needs to know about a symbol in minimal tokens.
+   * Combines signature, callers, deps, and impact into one concise result.
+   */
+  context(symbolRef: string): CodeGraphResult {
+    const start = Date.now();
+    const locations = this.resolveSymbol(symbolRef);
+
+    if (locations.length === 0) {
+      return this.errorResult("context", "SYMBOL_NOT_FOUND", `No symbol '${symbolRef}' found`, start);
+    }
+    if (locations.length > 1) {
+      return this.ambiguousResult("context", symbolRef, locations, start);
+    }
+
+    const loc = locations[0];
+    const sourceFile = this.program.getSourceFile(loc.fileName);
+    if (!sourceFile) {
+      return this.errorResult("context", "FILE_NOT_FOUND", `Source file not found`, start);
+    }
+
+    const checker = this.program.getTypeChecker();
+
+    // 1. Signature
+    const node = this.findNodeAtPosition(sourceFile, loc.position);
+    let typeString = "";
+    let params: Array<{ name: string; type: string }> = [];
+    let returnType = "";
+    let members: Array<{ name: string; type: string }> = [];
+
+    if (node) {
+      const sym = checker.getSymbolAtLocation(node);
+      if (sym) {
+        const type = checker.getTypeOfSymbolAtLocation(sym, node);
+        typeString = checker.typeToString(type, undefined, ts.TypeFormatFlags.NoTruncation);
+
+        const sigs = type.getCallSignatures();
+        if (sigs.length > 0) {
+          params = sigs[0].getParameters().map(p => ({
+            name: p.getName(),
+            type: checker.typeToString(checker.getTypeOfSymbolAtLocation(p, node), undefined, ts.TypeFormatFlags.NoTruncation),
+          }));
+          returnType = checker.typeToString(sigs[0].getReturnType(), undefined, ts.TypeFormatFlags.NoTruncation);
+        }
+
+        const props = type.getProperties();
+        if (props.length > 0 && sigs.length === 0) {
+          members = props.slice(0, 15).map(p => ({
+            name: p.getName(),
+            type: checker.typeToString(checker.getTypeOfSymbolAtLocation(p, node), undefined, ts.TypeFormatFlags.NoTruncation),
+          }));
+        }
+      }
+    }
+
+    // 2. Source snippet (just the declaration, not the body)
+    const declNode = this.findDeclarationAtPosition(sourceFile, loc.position);
+    let snippet = "";
+    if (declNode) {
+      const declText = declNode.getText(sourceFile);
+      // For functions, show just the signature (up to opening brace)
+      const braceIdx = declText.indexOf("{");
+      if (braceIdx > 0 && (loc.kind === "function" || loc.kind === "method")) {
+        snippet = declText.substring(0, braceIdx).trim();
+      } else if (declText.length > 300) {
+        snippet = declText.substring(0, 300) + "...";
+      } else {
+        snippet = declText;
+      }
+    }
+
+    // 3. Callers (top 5)
+    const refs = this.service.findReferences(loc.fileName, loc.position);
+    const callers: Array<{ file: string; line: number; text: string }> = [];
+    const importedBy: string[] = [];
+    let totalRefs = 0;
+    const filesUsedIn = new Set<string>();
+
+    if (refs) {
+      for (const refGroup of refs) {
+        for (const ref of refGroup.references) {
+          if (ref.isDefinition) continue;
+          const refSf = this.program.getSourceFile(ref.fileName);
+          if (!refSf || refSf.isDeclarationFile) continue;
+          const relPath = path.relative(this.projectRoot, ref.fileName);
+          if (relPath.startsWith("..")) continue;
+
+          totalRefs++;
+          filesUsedIn.add(relPath);
+
+          const { line } = refSf.getLineAndCharacterOfPosition(ref.textSpan.start);
+          const lineText = refSf.getFullText().substring(
+            refSf.getPositionOfLineAndCharacter(line, 0),
+            refSf.getLineEndOfPosition(ref.textSpan.start)
+          ).trim();
+
+          if (lineText.startsWith("import") || (lineText.startsWith("export") && lineText.includes("from"))) {
+            if (importedBy.length < 5) importedBy.push(relPath);
+          } else if (callers.length < 5) {
+            callers.push({ file: relPath, line: line + 1, text: lineText });
+          }
+        }
+      }
+    }
+
+    // 4. Dependencies (from deps)
+    const depsResult = this.deps(symbolRef);
+    const dependencies = depsResult.success ? depsResult.result : {};
+
+    // 5. Is exported?
+    let isExported = false;
+    const srcSymbol = checker.getSymbolAtLocation(sourceFile);
+    if (srcSymbol) {
+      const exps = checker.getExportsOfModule(srcSymbol);
+      isExported = exps.some(e => e.getName() === loc.name);
+    }
+
+    return {
+      success: true,
+      operation: "context",
+      duration_ms: Date.now() - start,
+      result: {
+        symbol: loc.name,
+        kind: loc.kind,
+        defined_in: `${path.relative(this.projectRoot, loc.fileName)}:${loc.line}`,
+        is_exported: isExported,
+        snippet,
+        ...(params.length > 0 ? { parameters: params } : {}),
+        ...(returnType ? { return_type: returnType } : {}),
+        ...(members.length > 0 ? { members } : {}),
+        usage: {
+          total_references: totalRefs,
+          files_used_in: filesUsedIn.size,
+          top_callers: callers,
+          imported_by: importedBy,
+        },
+        dependencies: {
+          imports: (dependencies as Record<string, unknown>).imports ?? [],
+          calls: (dependencies as Record<string, unknown>).calls ?? [],
+          type_references: (dependencies as Record<string, unknown>).type_references ?? [],
+        },
+      },
+      files_modified: [],
+      warnings: [],
+      errors: [],
+    };
+  }
+
+  /**
+   * Get a project overview — structure, entry points, key types, module map.
+   */
+  overview(): CodeGraphResult {
+    const start = Date.now();
+    const checker = this.program.getTypeChecker();
+
+    // Count files per directory
+    const dirCounts = new Map<string, number>();
+    const allFiles: string[] = [];
+    let totalLines = 0;
+
+    for (const sf of this.program.getSourceFiles()) {
+      if (sf.isDeclarationFile) continue;
+      const relPath = path.relative(this.projectRoot, sf.fileName);
+      if (relPath.startsWith("..") || relPath.includes("node_modules")) continue;
+
+      allFiles.push(relPath);
+      totalLines += sf.getLineAndCharacterOfPosition(sf.getEnd()).line + 1;
+
+      const dir = path.dirname(relPath);
+      dirCounts.set(dir, (dirCounts.get(dir) ?? 0) + 1);
+    }
+
+    // Sort directories by file count
+    const directories = [...dirCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([dir, count]) => ({ directory: dir, files: count }));
+
+    // Find entry points (files with no importers, or index files)
+    const entryPoints: Array<{ file: string; exports: number }> = [];
+    for (const sf of this.program.getSourceFiles()) {
+      if (sf.isDeclarationFile) continue;
+      const relPath = path.relative(this.projectRoot, sf.fileName);
+      if (relPath.startsWith("..") || relPath.includes("node_modules")) continue;
+
+      const baseName = path.basename(relPath);
+      if (baseName === "index.ts" || baseName === "index.tsx" || baseName === "main.ts" || baseName === "app.ts") {
+        const fileSymbol = checker.getSymbolAtLocation(sf);
+        const exportCount = fileSymbol ? checker.getExportsOfModule(fileSymbol).length : 0;
+        entryPoints.push({ file: relPath, exports: exportCount });
+      }
+    }
+
+    // Find key types (most referenced interfaces/types/classes)
+    const typeUsage = new Map<string, { name: string; kind: string; file: string; refs: number }>();
+
+    for (const sf of this.program.getSourceFiles()) {
+      if (sf.isDeclarationFile) continue;
+      const relPath = path.relative(this.projectRoot, sf.fileName);
+      if (relPath.startsWith("..") || relPath.includes("node_modules")) continue;
+
+      this.walkTree(sf, (node) => {
+        if (!ts.isIdentifier(node) || !this.isDeclaration(node)) return;
+        const parent = node.parent;
+        if (!ts.isInterfaceDeclaration(parent) && !ts.isTypeAliasDeclaration(parent) && !ts.isClassDeclaration(parent) && !ts.isEnumDeclaration(parent)) return;
+
+        const key = `${relPath}:${node.text}`;
+        if (typeUsage.has(key)) return;
+
+        const refs = this.service.findReferences(sf.fileName, node.getStart());
+        let refCount = 0;
+        if (refs) {
+          for (const g of refs) {
+            refCount += g.references.filter(r => !r.isDefinition).length;
+          }
+        }
+
+        if (refCount > 2) {
+          typeUsage.set(key, {
+            name: node.text,
+            kind: this.getNodeKind(parent),
+            file: relPath,
+            refs: refCount,
+          });
+        }
+      });
+
+      // Limit scanning time — stop after finding enough types
+      if (typeUsage.size >= 20) break;
+    }
+
+    const keyTypes = [...typeUsage.values()]
+      .sort((a, b) => b.refs - a.refs)
+      .slice(0, 10);
+
+    return {
+      success: true,
+      operation: "overview",
+      duration_ms: Date.now() - start,
+      result: {
+        project_root: this.projectRoot,
+        total_files: allFiles.length,
+        total_lines: totalLines,
+        directories,
+        entry_points: entryPoints.slice(0, 10),
+        key_types: keyTypes,
+      },
+      files_modified: [],
+      warnings: [],
+      errors: [],
+    };
+  }
+
+  /**
+   * Wrap a mutation result with auto type-check.
+   * Re-initializes the program and checks for type errors introduced by the mutation.
+   */
+  withTypeCheck(result: CodeGraphResult): CodeGraphResult {
+    if (!result.success || result.files_modified.length === 0) return result;
+    if ((result.result as Record<string, unknown>).dry_run) return result;
+
+    // Re-init to pick up file changes
+    this.program = this.service.getProgram()!;
+    const typeErrors = this.quickTypeCheck();
+
+    if (typeErrors.length > 0) {
+      result.warnings.push({
+        code: "TYPE_ERRORS_INTRODUCED",
+        message: `${typeErrors.length} type error(s) after ${result.operation}. Run 'codegraph undo' to revert.`,
+      });
+      (result.result as Record<string, unknown>).type_errors = typeErrors;
+    } else {
+      (result.result as Record<string, unknown>).type_check = "pass";
+    }
+
+    return result;
+  }
+
+  /**
+   * Run type-check and return compact diagnostics for embedding in mutation results.
+   */
+  private quickTypeCheck(): Array<{ file: string; line: number; message: string }> {
+    const diagnostics = this.program.getSemanticDiagnostics();
+    const errors: Array<{ file: string; line: number; message: string }> = [];
+
+    for (const diag of diagnostics) {
+      if (diag.category !== ts.DiagnosticCategory.Error) continue;
+      if (!diag.file) continue;
+      const relPath = path.relative(this.projectRoot, diag.file.fileName);
+      if (relPath.startsWith("..") || relPath.includes("node_modules")) continue;
+      const { line } = diag.file.getLineAndCharacterOfPosition(diag.start ?? 0);
+      errors.push({
+        file: relPath,
+        line: line + 1,
+        message: ts.flattenDiagnosticMessageText(diag.messageText, "\n"),
+      });
+      if (errors.length >= 10) break; // cap at 10
+    }
+    return errors;
+  }
+
+  /**
    * Refresh the program after external file changes.
    */
   refresh(): void {

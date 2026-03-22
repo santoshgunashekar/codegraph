@@ -258,7 +258,7 @@ async function main(): Promise<void> {
 
     case "rename":
       if (!args.symbol || !args.to) { exitMissingArg("rename", "--symbol <old> --to <new>"); return; }
-      result = service.rename(args.symbol, args.to, args.dryRun);
+      result = service.withTypeCheck(service.rename(args.symbol, args.to, args.dryRun));
       break;
 
     case "dead-code":
@@ -272,17 +272,26 @@ async function main(): Promise<void> {
 
     case "move":
       if (!args.symbol || !args.to) { exitMissingArg("move", "--symbol <name> --to <file>"); return; }
-      result = service.moveSymbol(args.symbol, args.to, args.dryRun);
+      result = service.withTypeCheck(service.moveSymbol(args.symbol, args.to, args.dryRun));
       break;
 
     case "add-param":
       if (!args.symbol || !args.name || !args.type) { exitMissingArg("add-param", "--function <name> --name <param> --type <type>"); return; }
-      result = service.addParam(args.symbol, args.name, args.type, args.default_value || undefined, args.position);
+      result = service.withTypeCheck(service.addParam(args.symbol, args.name, args.type, args.default_value || undefined, args.position));
       break;
 
     case "delete":
       if (!args.symbol) { exitMissingArg("delete", "--symbol <name>"); return; }
-      result = service.deleteSymbol(args.symbol, args.dryRun);
+      result = service.withTypeCheck(service.deleteSymbol(args.symbol, args.dryRun));
+      break;
+
+    case "context":
+      if (!args.symbol) { exitMissingArg("context", "--of <symbol>"); return; }
+      result = service.context(args.symbol);
+      break;
+
+    case "overview":
+      result = service.overview();
       break;
 
     case "type-check":
