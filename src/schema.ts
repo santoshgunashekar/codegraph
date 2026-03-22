@@ -130,8 +130,66 @@ const tools: ToolSchema[] = [
     },
   },
   {
+    name: "codegraph_type_check",
+    description: "Run the TypeScript type checker and return structured diagnostics. Returns every error and warning with file, line, error code, and message. Use after mutations to verify correctness.",
+    parameters: {
+      type: "object",
+      properties: {
+        scope: { type: "string", description: "Directory to check (e.g. 'src/'). Omit for entire project." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "codegraph_deps",
+    description: "Get the dependencies of a symbol — what it imports, calls, and type-references. Shows the full dependency graph for a single symbol without reading any files.",
+    parameters: {
+      type: "object",
+      properties: {
+        symbol: { type: "string", description: "Symbol to analyze dependencies for" },
+      },
+      required: ["symbol"],
+    },
+  },
+  {
+    name: "codegraph_exports",
+    description: "List all exports of a module or directory. Resolves re-exports, barrel files, and namespace exports instantly.",
+    parameters: {
+      type: "object",
+      properties: {
+        module: { type: "string", description: "Module path (file or directory, relative to project root)" },
+      },
+      required: ["module"],
+    },
+  },
+  {
+    name: "codegraph_signature",
+    description: "Get the full resolved type signature of any symbol. For functions: parameters with types, return type, generics. For interfaces/classes: all members with resolved types. No need to read the source file.",
+    parameters: {
+      type: "object",
+      properties: {
+        symbol: { type: "string", description: "Symbol to get signature for" },
+      },
+      required: ["symbol"],
+    },
+  },
+  {
+    name: "codegraph_extract_function",
+    description: "Extract a range of code lines from an existing function into a new function. Automatically determines parameters (captured variables), return type, and async. Replaces the original code with a call to the new function.",
+    parameters: {
+      type: "object",
+      properties: {
+        source: { type: "string", description: "Source function to extract from" },
+        start_line: { type: "number", description: "Start line of code to extract (1-indexed)" },
+        end_line: { type: "number", description: "End line of code to extract (1-indexed)" },
+        name: { type: "string", description: "Name for the new function" },
+      },
+      required: ["source", "start_line", "end_line", "name"],
+    },
+  },
+  {
     name: "codegraph_undo",
-    description: "Undo the last codegraph mutation (rename, move, add-param, delete). Restores all modified files to their previous state.",
+    description: "Undo the last codegraph mutation (rename, move, add-param, delete, extract-function). Restores all modified files to their previous state.",
     parameters: {
       type: "object",
       properties: {},
@@ -168,12 +226,17 @@ export function getSchema(format: string = "openai"): string {
       "  codegraph check-unused --symbol <name>    Check if symbol is unused",
       "  codegraph dead-code [--scope <path>]      Find all dead code",
       "  codegraph impact --of <symbol>            Blast radius analysis",
+      "  codegraph deps --of <symbol>              Dependencies of a symbol",
+      "  codegraph exports --module <path>         List module exports",
+      "  codegraph signature --of <symbol>         Full type signature",
+      "  codegraph type-check [--scope <path>]     Structured type checker diagnostics",
       "",
       "MUTATE COMMANDS:\n",
       "  codegraph rename --symbol <old> --to <new> [--dry-run]",
       "  codegraph move --symbol <name> --to <file> [--dry-run]",
       "  codegraph add-param --function <fn> --name <n> --type <t> [--default <v>]",
       "  codegraph delete --symbol <name> [--dry-run]",
+      "  codegraph extract-function --source <fn> --lines <start-end> --name <new>",
       "  codegraph undo",
       "",
       "OTHER:\n",

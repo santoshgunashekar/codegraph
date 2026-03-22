@@ -1091,6 +1091,515 @@ export class CodeGraphService {
   }
 
   /**
+   * Run the type checker and return structured diagnostics.
+   */
+  typeCheck(scope?: string): CodeGraphResult {
+    const start = Date.now();
+    const diagnostics: Array<{
+      file: string;
+      line: number;
+      column: number;
+      code: number;
+      category: string;
+      message: string;
+    }> = [];
+
+    const allDiagnostics = [
+      ...this.program.getSemanticDiagnostics(),
+      ...this.program.getSyntacticDiagnostics(),
+    ];
+
+    for (const diag of allDiagnostics) {
+      if (!diag.file) continue;
+      const relPath = path.relative(this.projectRoot, diag.file.fileName);
+      if (relPath.startsWith("..") || relPath.includes("node_modules")) continue;
+      if (scope && !relPath.startsWith(scope)) continue;
+
+      const { line, character } = diag.file.getLineAndCharacterOfPosition(diag.start ?? 0);
+      const category = diag.category === ts.DiagnosticCategory.Error ? "error"
+        : diag.category === ts.DiagnosticCategory.Warning ? "warning" : "info";
+
+      diagnostics.push({
+        file: relPath,
+        line: line + 1,
+        column: character + 1,
+        code: diag.code,
+        category,
+        message: ts.flattenDiagnosticMessageText(diag.messageText, "\n"),
+      });
+    }
+
+    const errors = diagnostics.filter(d => d.category === "error");
+    const warnings = diagnostics.filter(d => d.category === "warning");
+
+    return {
+      success: true,
+      operation: "type-check",
+      duration_ms: Date.now() - start,
+      result: {
+        scope: scope ?? ".",
+        total_errors: errors.length,
+        total_warnings: warnings.length,
+        pass: errors.length === 0,
+        diagnostics,
+      },
+      files_modified: [],
+      warnings: [],
+      errors: [],
+    };
+  }
+
+  /**
+   * Get the dependencies of a symbol — what it imports, calls, and references.
+   */
+  deps(symbolRef: string): CodeGraphResult {
+    const start = Date.now();
+    const locations = this.resolveSymbol(symbolRef);
+
+    if (locations.length === 0) {
+      return this.errorResult("deps", "SYMBOL_NOT_FOUND", `No symbol '${symbolRef}' found`, start);
+    }
+    if (locations.length > 1) {
+      return this.ambiguousResult("deps", symbolRef, locations, start);
+    }
+
+    const loc = locations[0];
+    const sourceFile = this.program.getSourceFile(loc.fileName);
+    if (!sourceFile) {
+      return this.errorResult("deps", "FILE_NOT_FOUND", `Source file not found`, start);
+    }
+
+    const checker = this.program.getTypeChecker();
+    const declNode = this.findDeclarationAtPosition(sourceFile, loc.position);
+    if (!declNode) {
+      return this.errorResult("deps", "NO_DECLARATION", `Could not find declaration`, start);
+    }
+
+    const imports: Array<{ symbol: string; from: string; kind: string }> = [];
+    const calls: Array<{ symbol: string; file: string; line: number }> = [];
+    const typeRefs: Array<{ symbol: string; kind: string }> = [];
+    const seen = new Set<string>();
+
+    this.walkTree(declNode, (node) => {
+      if (ts.isIdentifier(node) && node !== declNode && node.text !== loc.name) {
+        const sym = checker.getSymbolAtLocation(node);
+        if (!sym || seen.has(node.text)) return;
+
+        const decls = sym.getDeclarations();
+        if (!decls || decls.length === 0) return;
+
+        const declFile = decls[0].getSourceFile();
+        if (declFile.isDeclarationFile) return;
+
+        const declRelPath = path.relative(this.projectRoot, declFile.fileName);
+
+        // Is it from a different file? (import)
+        if (declFile.fileName !== loc.fileName) {
+          if (!seen.has(`import:${node.text}`)) {
+            seen.add(`import:${node.text}`);
+            imports.push({
+              symbol: node.text,
+              from: declRelPath,
+              kind: this.getNodeKind(decls[0]),
+            });
+          }
+        }
+
+        // Is it a call?
+        if (node.parent && ts.isCallExpression(node.parent) && node.parent.expression === node) {
+          const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart());
+          calls.push({
+            symbol: node.text,
+            file: declRelPath,
+            line: line + 1,
+          });
+        }
+
+        // Is it a type reference?
+        if (node.parent && (
+          ts.isTypeReferenceNode(node.parent) ||
+          ts.isExpressionWithTypeArguments(node.parent)
+        )) {
+          if (!seen.has(`type:${node.text}`)) {
+            seen.add(`type:${node.text}`);
+            typeRefs.push({
+              symbol: node.text,
+              kind: this.getNodeKind(decls[0]),
+            });
+          }
+        }
+      }
+    });
+
+    return {
+      success: true,
+      operation: "deps",
+      duration_ms: Date.now() - start,
+      result: {
+        symbol: loc.name,
+        kind: loc.kind,
+        defined_in: `${path.relative(this.projectRoot, loc.fileName)}:${loc.line}`,
+        imports,
+        calls,
+        type_references: typeRefs,
+        total_dependencies: imports.length + typeRefs.length,
+      },
+      files_modified: [],
+      warnings: [],
+      errors: [],
+    };
+  }
+
+  /**
+   * List all exports of a module/directory.
+   */
+  exports(modulePath: string): CodeGraphResult {
+    const start = Date.now();
+    const fullPath = path.resolve(this.projectRoot, modulePath);
+    const checker = this.program.getTypeChecker();
+
+    const exportList: Array<{
+      symbol: string;
+      kind: string;
+      file: string;
+      line: number;
+      re_exported: boolean;
+    }> = [];
+
+    // Find source files matching the module path
+    const matchingFiles: ts.SourceFile[] = [];
+    for (const sf of this.program.getSourceFiles()) {
+      if (sf.isDeclarationFile) continue;
+      const relPath = path.relative(this.projectRoot, sf.fileName);
+      if (relPath.startsWith("..") || relPath.includes("node_modules")) continue;
+
+      if (fs.statSync(fullPath).isDirectory()) {
+        if (sf.fileName.startsWith(fullPath)) {
+          matchingFiles.push(sf);
+        }
+      } else {
+        // Exact file match
+        if (sf.fileName === fullPath || sf.fileName === fullPath + ".ts" || sf.fileName === fullPath + ".tsx") {
+          matchingFiles.push(sf);
+        }
+      }
+    }
+
+    if (matchingFiles.length === 0) {
+      return this.errorResult("exports", "MODULE_NOT_FOUND", `No module found at '${modulePath}'`, start);
+    }
+
+    for (const sf of matchingFiles) {
+      const fileSymbol = checker.getSymbolAtLocation(sf);
+      if (!fileSymbol) continue;
+
+      const exports = checker.getExportsOfModule(fileSymbol);
+      for (const exp of exports) {
+        const decls = exp.getDeclarations();
+        if (!decls || decls.length === 0) continue;
+
+        const decl = decls[0];
+        const declFile = decl.getSourceFile();
+        const { line } = declFile.getLineAndCharacterOfPosition(decl.getStart());
+
+        const isReExport = declFile.fileName !== sf.fileName;
+
+        exportList.push({
+          symbol: exp.getName(),
+          kind: this.getNodeKind(decl),
+          file: path.relative(this.projectRoot, declFile.fileName),
+          line: line + 1,
+          re_exported: isReExport,
+        });
+      }
+    }
+
+    return {
+      success: true,
+      operation: "exports",
+      duration_ms: Date.now() - start,
+      result: {
+        module: modulePath,
+        files_scanned: matchingFiles.length,
+        total_exports: exportList.length,
+        exports: exportList,
+      },
+      files_modified: [],
+      warnings: [],
+      errors: [],
+    };
+  }
+
+  /**
+   * Get the full resolved type signature of a symbol.
+   */
+  signature(symbolRef: string): CodeGraphResult {
+    const start = Date.now();
+    const locations = this.resolveSymbol(symbolRef);
+
+    if (locations.length === 0) {
+      return this.errorResult("signature", "SYMBOL_NOT_FOUND", `No symbol '${symbolRef}' found`, start);
+    }
+    if (locations.length > 1) {
+      return this.ambiguousResult("signature", symbolRef, locations, start);
+    }
+
+    const loc = locations[0];
+    const sourceFile = this.program.getSourceFile(loc.fileName);
+    if (!sourceFile) {
+      return this.errorResult("signature", "FILE_NOT_FOUND", `Source file not found`, start);
+    }
+
+    const checker = this.program.getTypeChecker();
+    const node = this.findNodeAtPosition(sourceFile, loc.position);
+    if (!node) {
+      return this.errorResult("signature", "NO_NODE", `Could not find node at position`, start);
+    }
+
+    const symbol = checker.getSymbolAtLocation(node);
+    if (!symbol) {
+      return this.errorResult("signature", "NO_SYMBOL", `Could not resolve symbol`, start);
+    }
+
+    const type = checker.getTypeOfSymbolAtLocation(symbol, node);
+    const typeString = checker.typeToString(type, undefined, ts.TypeFormatFlags.NoTruncation);
+
+    // Get detailed info based on kind
+    const result: Record<string, unknown> = {
+      symbol: loc.name,
+      kind: loc.kind,
+      defined_in: `${path.relative(this.projectRoot, loc.fileName)}:${loc.line}`,
+      type: typeString,
+    };
+
+    // For functions, extract parameters and return type
+    const signatures = type.getCallSignatures();
+    if (signatures.length > 0) {
+      const sig = signatures[0];
+      result.parameters = sig.getParameters().map(p => {
+        const paramType = checker.getTypeOfSymbolAtLocation(p, node);
+        return {
+          name: p.getName(),
+          type: checker.typeToString(paramType, undefined, ts.TypeFormatFlags.NoTruncation),
+          optional: (p.flags & ts.SymbolFlags.Optional) !== 0,
+        };
+      });
+      const returnType = sig.getReturnType();
+      result.return_type = checker.typeToString(returnType, undefined, ts.TypeFormatFlags.NoTruncation);
+
+      if (sig.typeParameters && sig.typeParameters.length > 0) {
+        result.type_parameters = sig.typeParameters.map(tp => tp.symbol.getName());
+      }
+    }
+
+    // For interfaces/classes, list members
+    const properties = type.getProperties();
+    if (properties.length > 0 && signatures.length === 0) {
+      result.members = properties.map(p => {
+        const memberType = checker.getTypeOfSymbolAtLocation(p, node);
+        return {
+          name: p.getName(),
+          type: checker.typeToString(memberType, undefined, ts.TypeFormatFlags.NoTruncation),
+          optional: (p.flags & ts.SymbolFlags.Optional) !== 0,
+        };
+      });
+    }
+
+    return {
+      success: true,
+      operation: "signature",
+      duration_ms: Date.now() - start,
+      result,
+      files_modified: [],
+      warnings: [],
+      errors: [],
+    };
+  }
+
+  /**
+   * Extract a range of code into a new function with correct signature.
+   */
+  extractFunction(
+    sourceSymbol: string,
+    startLine: number,
+    endLine: number,
+    newName: string,
+  ): CodeGraphResult {
+    const start = Date.now();
+    const locations = this.resolveSymbol(sourceSymbol);
+
+    if (locations.length === 0) {
+      return this.errorResult("extract-function", "SYMBOL_NOT_FOUND", `No symbol '${sourceSymbol}' found`, start);
+    }
+    if (locations.length > 1) {
+      return this.ambiguousResult("extract-function", sourceSymbol, locations, start);
+    }
+
+    const loc = locations[0];
+    const sourceFile = this.program.getSourceFile(loc.fileName);
+    if (!sourceFile) {
+      return this.errorResult("extract-function", "FILE_NOT_FOUND", `Source file not found`, start);
+    }
+
+    const checker = this.program.getTypeChecker();
+
+    // Get the source function declaration
+    const funcNode = this.findDeclarationAtPosition(sourceFile, loc.position);
+    if (!funcNode || (!ts.isFunctionDeclaration(funcNode) && !ts.isMethodDeclaration(funcNode))) {
+      return this.errorResult("extract-function", "NOT_A_FUNCTION", `'${sourceSymbol}' is not a function`, start);
+    }
+
+    // Get the lines to extract (1-indexed to 0-indexed)
+    const sl = startLine - 1;
+    const el = endLine - 1;
+    const fullText = sourceFile.getFullText();
+    const lines = fullText.split("\n");
+
+    if (sl < 0 || el >= lines.length || sl > el) {
+      return this.errorResult("extract-function", "INVALID_RANGE", `Line range ${startLine}-${endLine} is invalid (file has ${lines.length} lines)`, start);
+    }
+
+    const extractedLines = lines.slice(sl, el + 1);
+    const extractedText = extractedLines.join("\n");
+
+    // Find the position range in the source
+    const extractStart = sourceFile.getPositionOfLineAndCharacter(sl, 0);
+    const extractEnd = el + 1 < lines.length
+      ? sourceFile.getPositionOfLineAndCharacter(el + 1, 0)
+      : fullText.length;
+
+    // Analyze variables: which are used in the extracted block?
+    // Walk the AST to find identifiers in the range
+    const usedIdentifiers = new Set<string>();
+    const assignedIdentifiers = new Set<string>();
+    const declaredInBlock = new Set<string>();
+
+    this.walkTree(funcNode, (node) => {
+      if (!ts.isIdentifier(node)) return;
+      const nodeStart = node.getStart();
+      if (nodeStart < extractStart || nodeStart >= extractEnd) return;
+
+      // Check if it's a variable/parameter reference
+      const sym = checker.getSymbolAtLocation(node);
+      if (!sym) return;
+
+      const decls = sym.getDeclarations();
+      if (!decls || decls.length === 0) return;
+
+      const declPos = decls[0].getStart();
+
+      // Declared inside the block
+      if (declPos >= extractStart && declPos < extractEnd) {
+        declaredInBlock.add(node.text);
+        return;
+      }
+
+      // Declared outside the block but in the function — it's a captured variable
+      const funcStart = funcNode.getStart();
+      const funcEnd = funcNode.getEnd();
+      if (declPos >= funcStart && declPos < funcEnd) {
+        usedIdentifiers.add(node.text);
+
+        // Check if it's being assigned
+        if (node.parent && ts.isBinaryExpression(node.parent) &&
+            node.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            node.parent.left === node) {
+          assignedIdentifiers.add(node.text);
+        }
+      }
+    });
+
+    // Build parameter list from captured variables
+    const params: Array<{ name: string; type: string }> = [];
+    for (const name of usedIdentifiers) {
+      // Find the type of this variable
+      const varType = this.findVariableType(funcNode, sourceFile, name, checker);
+      params.push({ name, type: varType });
+    }
+
+    // Determine if the block is async (contains await)
+    let isAsync = false;
+    this.walkTree(funcNode, (node) => {
+      const nodeStart = node.getStart();
+      if (nodeStart < extractStart || nodeStart >= extractEnd) return;
+      if (ts.isAwaitExpression(node)) isAsync = true;
+    });
+
+    // Determine return type — what variables declared or modified in the block
+    // are used after the block?
+    const returnVars: string[] = [];
+    for (const name of assignedIdentifiers) {
+      // Check if the variable is used after the extracted block
+      this.walkTree(funcNode, (node) => {
+        if (!ts.isIdentifier(node) || node.text !== name) return;
+        const nodeStart = node.getStart();
+        if (nodeStart >= extractEnd) {
+          if (!returnVars.includes(name)) returnVars.push(name);
+        }
+      });
+    }
+
+    // Build the new function
+    const paramStr = params.map(p => `${p.name}: ${p.type}`).join(", ");
+    const asyncPrefix = isAsync ? "async " : "";
+
+    let returnType = "void";
+    let callReturnHandling = "";
+    if (returnVars.length === 1) {
+      const varType = this.findVariableType(funcNode, sourceFile, returnVars[0], checker);
+      returnType = varType;
+      callReturnHandling = `const ${returnVars[0]} = `;
+    } else if (returnVars.length > 1) {
+      returnType = `{ ${returnVars.map(v => `${v}: ${this.findVariableType(funcNode, sourceFile, v, checker)}`).join("; ")} }`;
+      callReturnHandling = `const { ${returnVars.join(", ")} } = `;
+    }
+
+    // Detect indentation
+    const firstLine = extractedLines[0];
+    const indent = firstLine.match(/^(\s*)/)?.[1] ?? "  ";
+
+    const newFunction = `${asyncPrefix}function ${newName}(${paramStr}): ${returnType} {\n${extractedText}\n${returnVars.length > 0 ? `${indent}return ${returnVars.length === 1 ? returnVars[0] : `{ ${returnVars.join(", ")} }`};\n` : ""}}`;
+
+    const awaitPrefix = isAsync ? "await " : "";
+    const callArgs = params.map(p => p.name).join(", ");
+    const callExpression = `${indent}${callReturnHandling}${awaitPrefix}${newName}(${callArgs});`;
+
+    // Apply changes
+    saveRollback(this.projectRoot, "extract-function", [loc.fileName]);
+
+    let content = fullText;
+    // Replace extracted lines with function call
+    content = content.substring(0, extractStart) + callExpression + "\n" + content.substring(extractEnd);
+
+    // Insert the new function before the source function
+    const funcStart = funcNode.getFullStart();
+    content = content.substring(0, funcStart) + newFunction + "\n\n" + content.substring(funcStart);
+
+    fs.writeFileSync(loc.fileName, content, "utf-8");
+
+    return {
+      success: true,
+      operation: "extract-function",
+      duration_ms: Date.now() - start,
+      result: {
+        extracted_from: loc.name,
+        new_function: newName,
+        parameters: params,
+        return_type: returnType,
+        is_async: isAsync,
+        mutations: returnVars,
+        lines_extracted: `${startLine}-${endLine}`,
+      },
+      files_modified: [path.relative(this.projectRoot, loc.fileName)],
+      warnings: assignedIdentifiers.size > 0 ? [{
+        code: "MUTATIONS",
+        message: `Extracted block modifies: ${[...assignedIdentifiers].join(", ")}. Verify return handling is correct.`,
+      }] : [],
+      errors: [],
+    };
+  }
+
+  /**
    * Refresh the program after external file changes.
    */
   refresh(): void {
@@ -1098,6 +1607,25 @@ export class CodeGraphService {
   }
 
   // --- Internal helpers ---
+
+  private findVariableType(
+    scopeNode: ts.Node,
+    sourceFile: ts.SourceFile,
+    name: string,
+    checker: ts.TypeChecker,
+  ): string {
+    let result = "unknown";
+    this.walkTree(scopeNode, (node) => {
+      if (ts.isIdentifier(node) && node.text === name) {
+        const sym = checker.getSymbolAtLocation(node);
+        if (sym) {
+          const type = checker.getTypeOfSymbolAtLocation(sym, node);
+          result = checker.typeToString(type, undefined, ts.TypeFormatFlags.NoTruncation);
+        }
+      }
+    });
+    return result;
+  }
 
   private hasExportModifier(node: ts.Node): boolean {
     if (!ts.canHaveModifiers(node)) return false;

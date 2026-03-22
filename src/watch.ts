@@ -93,6 +93,24 @@ export function startWatchServer(tsconfigPath: string): void {
               service = new CodeGraphService(tsconfigPath);
             }
             break;
+          case "type-check":
+            result = service.typeCheck(args.scope);
+            break;
+          case "deps":
+            result = service.deps(args.symbol);
+            break;
+          case "exports":
+            result = service.exports(args.module);
+            break;
+          case "signature":
+            result = service.signature(args.symbol);
+            break;
+          case "extract-function":
+            result = service.extractFunction(args.source, args.startLine, args.endLine, args.name);
+            if (result.success) {
+              service = new CodeGraphService(tsconfigPath);
+            }
+            break;
           case "ping":
             result = {
               success: true,

@@ -197,6 +197,85 @@ async function main(): Promise<void> {
   );
 
   server.registerTool(
+    "codegraph_type_check",
+    {
+      description: "Run the TypeScript type checker and return structured diagnostics. Returns every error and warning with file, line, error code, and message.",
+      inputSchema: {
+        scope: z.string().optional().describe("Directory to check (e.g. 'src/'). Omit for entire project."),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ scope }) => {
+      const result = service.typeCheck(scope);
+      return { content: [{ type: "text" as const, text: formatResult(result) }] };
+    }
+  );
+
+  server.registerTool(
+    "codegraph_deps",
+    {
+      description: "Get the dependencies of a symbol — what it imports, calls, and type-references. Shows the full dependency graph for a single symbol without reading files.",
+      inputSchema: {
+        symbol: z.string().describe("Symbol to analyze dependencies for"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ symbol }) => {
+      const result = service.deps(symbol);
+      return { content: [{ type: "text" as const, text: formatResult(result) }] };
+    }
+  );
+
+  server.registerTool(
+    "codegraph_exports",
+    {
+      description: "List all exports of a module or directory. Resolves re-exports, barrel files, and namespace exports.",
+      inputSchema: {
+        module: z.string().describe("Module path (file or directory, relative to project root)"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ module }) => {
+      const result = service.exports(module);
+      return { content: [{ type: "text" as const, text: formatResult(result) }] };
+    }
+  );
+
+  server.registerTool(
+    "codegraph_signature",
+    {
+      description: "Get the full resolved type signature of any symbol. For functions: parameters, return type, generics. For interfaces/classes: all members with types.",
+      inputSchema: {
+        symbol: z.string().describe("Symbol to get signature for"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ symbol }) => {
+      const result = service.signature(symbol);
+      return { content: [{ type: "text" as const, text: formatResult(result) }] };
+    }
+  );
+
+  server.registerTool(
+    "codegraph_extract_function",
+    {
+      description: "Extract a range of code lines from an existing function into a new function. Automatically determines parameters (captured variables), return type, and async. Replaces the original code with a call to the new function.",
+      inputSchema: {
+        source: z.string().describe("Source function to extract from"),
+        start_line: z.number().describe("Start line of code to extract (1-indexed)"),
+        end_line: z.number().describe("End line of code to extract (1-indexed)"),
+        name: z.string().describe("Name for the new function"),
+      },
+      annotations: { destructiveHint: true },
+    },
+    async ({ source, start_line, end_line, name }) => {
+      const result = service.extractFunction(source, start_line, end_line, name);
+      if (result.success) reinit();
+      return { content: [{ type: "text" as const, text: formatResult(result) }] };
+    }
+  );
+
+  server.registerTool(
     "codegraph_undo",
     {
       description: "Undo the last codegraph mutation (rename, move, add-param, delete). Restores all modified files to their previous state.",

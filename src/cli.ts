@@ -30,6 +30,9 @@ function parseArgs(args: string[]): {
   type: string;
   default_value: string;
   position: number | undefined;
+  lines: string;
+  module: string;
+  source: string;
 } {
   const result: ReturnType<typeof parseArgs> = {
     command: "",
@@ -43,6 +46,9 @@ function parseArgs(args: string[]): {
     type: "",
     default_value: "",
     position: undefined,
+    lines: "",
+    module: "",
+    source: "",
   };
 
   let i = 0;
@@ -85,6 +91,15 @@ function parseArgs(args: string[]): {
         break;
       case "--position":
         result.position = parseInt(args[++i] ?? "", 10);
+        break;
+      case "--lines":
+        result.lines = args[++i] ?? "";
+        break;
+      case "--module":
+        result.module = args[++i] ?? "";
+        break;
+      case "--source":
+        result.source = args[++i] ?? "";
         break;
       default:
         break;
@@ -269,6 +284,41 @@ async function main(): Promise<void> {
       if (!args.symbol) { exitMissingArg("delete", "--symbol <name>"); return; }
       result = service.deleteSymbol(args.symbol, args.dryRun);
       break;
+
+    case "type-check":
+      result = service.typeCheck(args.scope || undefined);
+      break;
+
+    case "deps":
+      if (!args.symbol) { exitMissingArg("deps", "--of <symbol>"); return; }
+      result = service.deps(args.symbol);
+      break;
+
+    case "exports":
+      if (!args.module) { exitMissingArg("exports", "--module <path>"); return; }
+      result = service.exports(args.module);
+      break;
+
+    case "signature":
+      if (!args.symbol) { exitMissingArg("signature", "--of <symbol>"); return; }
+      result = service.signature(args.symbol);
+      break;
+
+    case "extract-function": {
+      if (!args.source || !args.lines || !args.name) {
+        exitMissingArg("extract-function", "--source <function> --lines <start-end> --name <newName>");
+        return;
+      }
+      const [startStr, endStr] = args.lines.split("-");
+      const startLine = parseInt(startStr, 10);
+      const endLine = parseInt(endStr, 10);
+      if (isNaN(startLine) || isNaN(endLine)) {
+        exitMissingArg("extract-function", "--lines <start-end> (e.g. --lines 15-28)");
+        return;
+      }
+      result = service.extractFunction(args.source, startLine, endLine, args.name);
+      break;
+    }
 
     default:
       console.log(JSON.stringify({

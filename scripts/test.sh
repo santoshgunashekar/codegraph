@@ -136,12 +136,45 @@ R=$($CLI move --symbol isAdmin --to src/auth.ts --dry-run 2>/dev/null)
 assert_success "move --dry-run" "$R"
 
 echo ""
+echo "NEW OPERATIONS:"
+
+# --- Type check ---
+R=$($CLI type-check 2>/dev/null)
+assert_success "type-check" "$R"
+PASS_CHECK=$(echo "$R" | grep '"pass": true')
+[ -n "$PASS_CHECK" ] && echo "    type check passes OK" || echo "    WARN: type check reports errors"
+
+# --- Deps ---
+R=$($CLI deps --of processOrder 2>/dev/null)
+assert_success "deps --of processOrder" "$R"
+TOTAL_DEPS=$(echo "$R" | grep '"total_dependencies"' | grep -o '[0-9]*')
+echo "    dependencies: $TOTAL_DEPS"
+
+# --- Exports ---
+R=$($CLI exports --module src 2>/dev/null)
+assert_success "exports --module src" "$R"
+TOTAL_EXPORTS=$(echo "$R" | grep '"total_exports"' | grep -o '[0-9]*')
+echo "    exports: $TOTAL_EXPORTS"
+
+# --- Signature (function) ---
+R=$($CLI signature --of createUser 2>/dev/null)
+assert_success "signature --of createUser (function)" "$R"
+RET_TYPE=$(echo "$R" | grep '"return_type"' | head -1)
+[ -n "$RET_TYPE" ] && echo "    has return_type OK" || echo "    WARN: no return_type"
+
+# --- Signature (interface) ---
+R=$($CLI signature --of User 2>/dev/null)
+assert_success "signature --of User (interface)" "$R"
+MEMBERS=$(echo "$R" | grep '"members"')
+[ -n "$MEMBERS" ] && echo "    has members OK" || echo "    WARN: no members"
+
+echo ""
 echo "OTHER:"
 
 # --- Schema ---
 TOOL_COUNT=$($CLI schema --format openai 2>/dev/null | grep '"name"' | wc -l | xargs)
 echo "  schema: $TOOL_COUNT tool schemas generated"
-[ "$TOOL_COUNT" -ge "10" ] && PASS=$((PASS + 1)) || FAIL=$((FAIL + 1))
+[ "$TOOL_COUNT" -ge "15" ] && PASS=$((PASS + 1)) || FAIL=$((FAIL + 1))
 
 # --- Help ---
 HELP=$($CLI 2>/dev/null | head -1)
